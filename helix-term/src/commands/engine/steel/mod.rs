@@ -1,5 +1,6 @@
 pub mod components;
 
+use anyhow::{bail, ensure};
 use arc_swap::{ArcSwap, ArcSwapAny};
 use helix_core::{
     command_line::Args,
@@ -18,7 +19,7 @@ use helix_core::{
         LanguageLoader,
     },
     text_annotations::InlineAnnotation,
-    Range, Selection, Tendril, Transaction,
+    Range, Selection, SmartString, Tendril, Transaction,
 };
 use helix_event::register_hook;
 use helix_lsp::jsonrpc;
@@ -668,6 +669,8 @@ fn load_static_commands(engine: &mut Engine, generate_sources: bool) {
         .register_fn_with_ctx(CTX, "current-selection->string", get_selection)
         .register_fn_with_ctx(CTX, "load-buffer!", load_buffer)
         .register_fn_with_ctx(CTX, "current-highlighted-text!", get_highlighted_text)
+        .register_fn_with_ctx(CTX, "get-document-text!", get_document_text)
+        .register_fn_with_ctx(CTX, "shell-command->string", return_shell_command)
         .register_fn_with_ctx(CTX, "get-current-line-number", current_line_number)
         .register_fn_with_ctx(CTX, "get-current-column-number", current_column_number)
         .register_fn_with_ctx(CTX, "current-selection-object", current_selection)
@@ -4600,6 +4603,89 @@ fn get_highlighted_text(cx: &mut Context) -> String {
     let (view, doc) = current_ref!(cx.editor);
     let text = doc.text().slice(..);
     doc.selection(view.id).primary().slice(text).to_string()
+}
+
+fn get_document_text(cx: &mut Context) -> String {
+    let (view, doc) = current_ref!(cx.editor);
+    doc.text().to_string()
+}
+
+fn return_shell_command(cx: &mut Context, cmd: String) -> String {
+    let x = tokio::task::block_in_place(|| {
+        helix_lsp::block_on(shell_impl_async(&cx.editor.config().shell, &cmd, None))
+    });
+    return x.unwrap_or(SmartString::new()).to_string();
+}
+
+async fn shell_impl_async(
+    shell: &[String],
+    cmd: &str,
+    input: Option<helix_core::Rope>,
+) -> anyhow::Result<Tendril> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+    ensure!(!shell.is_empty(), "No shell set");
+
+    let mut process = Command::new(&shell[0]);
+    process
+        .args(&shell[1..])
+        .arg(cmd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if input.is_some() || cfg!(windows) {
+        process.stdin(Stdio::piped());
+    } else {
+        process.stdin(Stdio::null());
+    }
+
+    let mut process = match process.spawn() {
+        Ok(process) => process,
+        Err(e) => {
+            log::error!("Failed to start shell: {}", e);
+            return Err(e.into());
+        }
+    };
+    let output = if let Some(mut stdin) = process.stdin.take() {
+        let input_task = tokio::spawn(async move {
+            if let Some(input) = input {
+                helix_view::document::to_writer(
+                    &mut stdin,
+                    (helix_core::encoding::UTF_8, false),
+                    &input,
+                )
+                .await?;
+            }
+            anyhow::Ok(())
+        });
+        let (output, _) = tokio::join! {
+            process.wait_with_output(),
+            input_task,
+        };
+        output?
+    } else {
+        // Process has no stdin, so we just take the output
+        process.wait_with_output().await?
+    };
+
+    let output = if !output.status.success() {
+        if output.stderr.is_empty() {
+            match output.status.code() {
+                Some(exit_code) => bail!("Shell command failed: status {}", exit_code),
+                None => bail!("Shell command failed"),
+            }
+        }
+        String::from_utf8_lossy(&output.stderr)
+        // Prioritize `stderr` output over `stdout`
+    } else if !output.stderr.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        log::debug!("Command printed to stderr: {stderr}");
+        stderr
+    } else {
+        String::from_utf8_lossy(&output.stdout)
+    };
+
+    Ok(Tendril::from(output))
 }
 
 fn current_selection(cx: &mut Context) -> Selection {

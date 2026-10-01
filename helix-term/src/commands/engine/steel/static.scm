@@ -173,3 +173,13 @@
 ;;@doc
 ;;Returns the path to the init.scm file as a string
 (define get-init-scm-path helix.static.get-init-scm-path)
+
+(provide shell-command->string)
+;;@doc
+;;Returns the output of the shell command
+(define shell-command->string helix.static.shell-command->string)
+
+(provide get-document-text!)
+;;@doc
+;;Returns the text of the entire document
+(define get-document-text! helix.static.get-document-text!)
